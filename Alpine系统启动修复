@@ -1,12 +1,12 @@
 #!/bin/sh
 # Alpine系统启动修复
 # Run: AS
-# Install: sh "Alpine系统启动修复 脚本" --install
+# Install: sh "Alpine系统启动修复脚本" --install
 
 set -u
 
 APP_NAME="Alpine系统启动修复"
-INSTALL_PATH="/usr/local/sbin/Alpine系统启动修复 脚本"
+INSTALL_PATH="/usr/local/sbin/Alpine系统启动修复脚本"
 SHORTCUT="/usr/local/bin/AS"
 CONFIG_DIR="/etc/alpine-startup-fix"
 CONFIG_FILE="$CONFIG_DIR/services.conf"
