@@ -1,0 +1,335 @@
+#!/bin/sh
+# Alpine系统启动修复
+# Run: AS
+# Install: sh "Alpine系统启动修复 脚本" --install
+
+set -u
+
+APP_NAME="Alpine系统启动修复"
+INSTALL_PATH="/usr/local/sbin/Alpine系统启动修复 脚本"
+SHORTCUT="/usr/local/bin/AS"
+CONFIG_DIR="/etc/alpine-startup-fix"
+CONFIG_FILE="$CONFIG_DIR/services.conf"
+HOOK_FILE="/etc/local.d/zz-alpine-startup-fix.start"
+BACKUP_DIR="/var/backups/alpine-startup-fix-$(date +%Y%m%d%H%M%S)"
+
+ESC="$(printf '\033')"
+RED="${ESC}[31m"
+GREEN="${ESC}[32m"
+YELLOW="${ESC}[33m"
+CYAN="${ESC}[36m"
+RESET="${ESC}[0m"
+
+say() { printf '%s\n' "$*"; }
+ok() { printf '%s%s%s\n' "$GREEN" "$*" "$RESET"; }
+warn() { printf '%s%s%s\n' "$YELLOW" "$*" "$RESET"; }
+err() { printf '%s%s%s\n' "$RED" "$*" "$RESET" >&2; }
+clear_screen() { printf '\033[2J\033[H'; }
+pause_screen() { printf '\n按 Enter 返回...'; read -r _pause || true; }
+
+require_root() {
+    if [ "$(id -u)" -eq 0 ]; then
+        ROOT_TEXT="${GREEN}root${RESET}"
+        return 0
+    fi
+    ROOT_TEXT="${RED}请使用root环境登录${RESET}"
+    return 1
+}
+
+ensure_config() {
+    mkdir -p "$CONFIG_DIR" /etc/local.d
+    [ -f "$CONFIG_FILE" ] || : > "$CONFIG_FILE"
+    chmod 600 "$CONFIG_FILE"
+}
+
+backup_file() {
+    file="$1"
+    if [ -e "$file" ] || [ -L "$file" ]; then
+        mkdir -p "$BACKUP_DIR"
+        dest="$BACKUP_DIR$(dirname "$file")"
+        mkdir -p "$dest"
+        cp -a "$file" "$dest/"
+    fi
+}
+
+service_exists() { [ -x "/etc/init.d/$1" ]; }
+
+is_core_service() {
+    case "$1" in
+        acpid|bootmisc|cgroups|crond|devfs|dmesg|fsck|hostname|hwclock|hwdrivers|killprocs|local|localmount|loopback|machine-id|mdev|mount-ro|networking|net-online|netmount|ntpd|procfs|root|savecache|seedrng|sshd|swap|sysctl|sysfs|sysfsconf|syslog|user|watchdog|staticroute|nftables|iptables|ip6tables|fail2ban)
+            return 0 ;;
+    esac
+    return 1
+}
+
+is_managed() {
+    svc="$1"
+    while IFS='|' read -r name command; do
+        [ "$name" = "$svc" ] && return 0
+    done < "$CONFIG_FILE"
+    return 1
+}
+
+# The service names are validated by the menu and contain no sed metacharacters.
+remove_mapping() {
+    svc="$1"
+    escaped=$(printf '%s' "$svc" | sed 's/[.[\\*^$]/\\&/g')
+    sed -i "/^${escaped}|/d" "$CONFIG_FILE"
+}
+
+add_mapping() {
+    svc="$1"
+    command="$2"
+    remove_mapping "$svc"
+    printf '%s|%s\n' "$svc" "$command" >> "$CONFIG_FILE"
+}
+
+remove_from_runlevels() {
+    svc="$1"
+    rc-update del "$svc" default >/dev/null 2>&1 || true
+    rc-update del "$svc" boot >/dev/null 2>&1 || true
+}
+
+create_hook() {
+    backup_file "$HOOK_FILE"
+    cat > "$HOOK_FILE" <<'EOF'
+#!/bin/sh
+# Managed by Alpine系统启动修复.
+CONFIG_FILE="/etc/alpine-startup-fix/services.conf"
+[ -r "$CONFIG_FILE" ] || exit 0
+
+while IFS='|' read -r service_name start_command; do
+    [ -n "$service_name" ] || continue
+    [ -n "$start_command" ] || continue
+    i=1
+    while [ "$i" -le 5 ]; do
+        if [ -x "/etc/init.d/$service_name" ] && rc-service "$service_name" status >/dev/null 2>&1; then
+            break
+        fi
+        if sh -c "$start_command" >/dev/null 2>&1; then
+            break
+        fi
+        sleep 3
+        i=$((i + 1))
+    done
+done < "$CONFIG_FILE"
+EOF
+    chmod 755 "$HOOK_FILE"
+    rc-update add local default >/dev/null 2>&1 || true
+}
+
+candidate_for_number() {
+    wanted="$1"
+    number=0
+    for path in /etc/init.d/*; do
+        [ -f "$path" ] || continue
+        svc=${path##*/}
+        is_core_service "$svc" && continue
+        case "$svc" in *.bak.*|functions.sh) continue ;; esac
+        is_managed "$svc" && continue
+        number=$((number + 1))
+        [ "$number" -eq "$wanted" ] && { printf '%s\n' "$svc"; return 0; }
+    done
+    return 1
+}
+
+show_available_apps() {
+    number=0
+    found=0
+    for path in /etc/init.d/*; do
+        [ -f "$path" ] || continue
+        svc=${path##*/}
+        is_core_service "$svc" && continue
+        case "$svc" in *.bak.*|functions.sh) continue ;; esac
+        is_managed "$svc" && continue
+        number=$((number + 1))
+        printf '  %s%-3s%s %s\n' "$GREEN" "$number." "$RESET" "$svc"
+        found=1
+    done
+    [ "$found" -eq 1 ] || warn "没有可添加的第三方应用。"
+}
+
+valid_number_list() {
+    case "$1" in
+        ''|*[!0-9\ ]*) return 1 ;;
+    esac
+    return 0
+}
+
+show_added_apps() {
+    ensure_config
+    clear_screen
+    say "${CYAN}=== 已添加的启动应用 ===${RESET}"
+    count=0
+    while IFS='|' read -r svc command; do
+        [ -n "$svc" ] || continue
+        count=$((count + 1))
+        if service_exists "$svc" && rc-service "$svc" status >/dev/null 2>&1; then
+            state="${GREEN}运行中${RESET}"
+        elif service_exists "$svc"; then
+            state="${YELLOW}已添加，当前未运行${RESET}"
+        else
+            state="${RED}服务文件不存在${RESET}"
+        fi
+        printf '  %s%-20s%s [%s]\n' "$GREEN" "$svc" "$RESET" "$state"
+    done < "$CONFIG_FILE"
+
+    [ "$count" -gt 0 ] || warn "当前没有已添加的启动应用。"
+    if [ "$count" -gt 0 ]; then
+        say ""
+        say "共 $count 个应用；状态根据当前 OpenRC 服务状态自动读取。"
+    fi
+    pause_screen
+}
+
+add_app() {
+    ensure_config
+    clear_screen
+    say "${CYAN}=== 可添加应用列表 ===${RESET}"
+    say "在序号之间添加空格可多选；输入 0 返回。"
+    say ""
+    show_available_apps
+    say ""
+    printf '请输入序号：'
+    read -r selection || return 0
+    [ "$selection" = "0" ] && return 0
+    valid_number_list "$selection" || { warn "请输入数字，多个序号之间使用空格。"; pause_screen; return; }
+
+    selected_services=""
+    for number in $selection; do
+        svc=$(candidate_for_number "$number") || {
+            warn "序号 $number 无效，未执行添加。"
+            pause_screen
+            return
+        }
+        case " $selected_services " in *" $svc "*) continue ;; esac
+        selected_services="$selected_services $svc"
+    done
+
+    for svc in $selected_services; do
+        command="rc-service $svc start"
+        add_mapping "$svc" "$command"
+        remove_from_runlevels "$svc"
+    done
+    create_hook
+
+    for svc in $selected_services; do
+        if rc-service "$svc" start >/dev/null 2>&1; then
+            ok "$svc 已添加，并已成功启动。"
+        else
+            warn "$svc 已添加，但当前启动失败，开机时将自动重试。"
+        fi
+    done
+    say "配置备份目录：$BACKUP_DIR"
+    pause_screen
+}
+
+service_for_added_number() {
+    wanted="$1"
+    number=0
+    while IFS='|' read -r name command; do
+        [ -n "$name" ] || continue
+        number=$((number + 1))
+        [ "$number" -eq "$wanted" ] && { printf '%s\n' "$name"; return 0; }
+    done < "$CONFIG_FILE"
+    return 1
+}
+
+delete_app() {
+    ensure_config
+    clear_screen
+    say "${CYAN}=== 可删除应用列表 ===${RESET}"
+    say "在序号之间添加空格可多选；输入 0 返回。"
+    say ""
+
+    number=0
+    while IFS='|' read -r svc command; do
+        [ -n "$svc" ] || continue
+        number=$((number + 1))
+        printf '  %s%-3s%s %s\n' "$GREEN" "$number." "$RESET" "$svc"
+    done < "$CONFIG_FILE"
+
+    [ "$number" -gt 0 ] || { warn "当前没有已添加的启动应用。"; pause_screen; return; }
+    say ""
+    printf '请输入序号：'
+    read -r selection || return 0
+    [ "$selection" = "0" ] && return 0
+    valid_number_list "$selection" || { warn "请输入数字，多个序号之间使用空格。"; pause_screen; return; }
+
+    selected_services=""
+    for number in $selection; do
+        svc=$(service_for_added_number "$number") || {
+            warn "序号 $number 无效，未执行删除。"
+            pause_screen
+            return
+        }
+        case " $selected_services " in *" $svc "*) continue ;; esac
+        selected_services="$selected_services $svc"
+    done
+
+    for svc in $selected_services; do
+        remove_mapping "$svc"
+        remove_from_runlevels "$svc"
+        ok "$svc 已取消自动启动；当前运行中的服务不会被停止。"
+    done
+    create_hook
+    pause_screen
+}
+
+install_self() {
+    [ "$(id -u)" -eq 0 ] || { err "安装快捷命令需要root环境。"; exit 1; }
+    [ -f "$0" ] || { err "找不到脚本自身路径。"; exit 1; }
+    mkdir -p "$(dirname "$INSTALL_PATH")" "$(dirname "$SHORTCUT")"
+    cp -f "$0" "$INSTALL_PATH"
+    chmod 755 "$INSTALL_PATH"
+    ln -sf "$INSTALL_PATH" "$SHORTCUT"
+    ok "已安装脚本：$INSTALL_PATH"
+    ok "快捷命令：AS"
+}
+
+show_menu() {
+    clear_screen
+    say "${CYAN}============================================${RESET}"
+    say "${CYAN}        $APP_NAME${RESET}"
+    say "${CYAN}============================================${RESET}"
+    say "登录环境：$ROOT_TEXT"
+    say "快捷键：AS    退出：0"
+    say ""
+    say "1. 已添加的启动应用"
+    say "2. 可添加应用列表"
+    say "3. 可删除应用列表"
+    say ""
+}
+
+if [ "${1-}" = "--install" ]; then
+    install_self
+    exit 0
+fi
+
+if ! require_root; then
+    clear_screen
+    say "${RED}============================================${RESET}"
+    say "${RED}        $APP_NAME${RESET}"
+    say "${RED}============================================${RESET}"
+    say "登录环境：${RED}请使用root环境登录${RESET}"
+    err "当前不是root环境，无法执行修复。"
+    exit 1
+fi
+
+ensure_config
+if [ -s "$CONFIG_FILE" ] && [ ! -x "$HOOK_FILE" ]; then
+    create_hook
+fi
+
+while :; do
+    show_menu
+    printf '请输入选项：'
+    read -r choice || exit 0
+    case "$choice" in
+        1) show_added_apps ;;
+        2) add_app ;;
+        3) delete_app ;;
+        0) clear_screen; ok "已退出。"; exit 0 ;;
+        *) warn "无效选项，请重新选择。"; sleep 1 ;;
+    esac
+done
